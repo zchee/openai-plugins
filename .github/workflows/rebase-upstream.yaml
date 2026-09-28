@@ -1,0 +1,117 @@
+name: Rebase onto upstream main
+
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rebase-upstream
+  cancel-in-progress: false
+
+env:
+  BRANCH: claude
+  UPSTREAM_URL: https://github.com/openai/plugins.git
+  UPSTREAM_BRANCH: main
+
+jobs:
+  rebase:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      # GITHUB_TOKEN cannot push commits that add or modify .github/workflows/*,
+      # and every rebase rewrites the commit that adds this file.
+      - name: Check required secrets
+        env:
+          REBASE_TOKEN: ${{ secrets.REBASE_TOKEN }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          missing=()
+          [[ -n "$REBASE_TOKEN" ]] || missing+=(REBASE_TOKEN)
+          [[ -n "$GPG_PRIVATE_KEY" ]] || missing+=(GPG_PRIVATE_KEY)
+          [[ -n "$GPG_PASSPHRASE" ]] || missing+=(GPG_PASSPHRASE)
+          if (( ${#missing[@]} )); then
+            echo "::error::missing repository secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.REBASE_TOKEN }}
+
+      - name: Fetch upstream
+        id: state
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+          old="$(git rev-parse HEAD)"
+          echo "old=$old" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD \
+            && [[ -z "$(git rev-list --merges "upstream/$UPSTREAM_BRANCH..HEAD")" ]]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "\`$BRANCH\` is already linear on top of \`upstream/$UPSTREAM_BRANCH\`; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import GPG key
+        if: steps.state.outputs.needed == 'true'
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          trust_level: 5
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+          git_committer_name: Koichi Shiraishi
+          git_committer_email: zchee.io@gmail.com
+
+      - name: Rebase
+        if: steps.state.outputs.needed == 'true'
+        run: |
+          base="upstream/$UPSTREAM_BRANCH"
+          if ! git rebase --gpg-sign "$base"; then
+            {
+              echo "## Rebase of \`$BRANCH\` onto \`$base\` stopped on a conflict"
+              echo
+              echo "Commit: \`$(git log -1 --format='%h %s' REBASE_HEAD)\`"
+              echo
+              echo "Conflicting paths:"
+              echo
+              git diff --name-only --diff-filter=U | while read -r path; do echo "- \`$path\`"; done
+              echo
+              echo "Resolve locally with \`git rebase --gpg-sign upstream/$UPSTREAM_BRANCH\` and force-push."
+            } >> "$GITHUB_STEP_SUMMARY"
+            git rebase --abort
+            echo "::error::rebase onto $base stopped on a conflict; see the job summary"
+            exit 1
+          fi
+
+          unsigned="$(git log --format='%h %G? %s' "$base..HEAD" | awk '$2 !~ /^[GU]$/')"
+          if [[ -n "$unsigned" ]]; then
+            echo "::error::commits without a good signature after rebase:"
+            echo "$unsigned"
+            exit 1
+          fi
+
+          {
+            echo "## Rebased \`$BRANCH\` onto \`$base\` ($(git rev-parse --short "$base"))"
+            echo
+            echo '```'
+            git log --format='%h %G? %s' "$base..HEAD"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push
+        if: steps.state.outputs.needed == 'true'
+        env:
+          OLD: ${{ steps.state.outputs.old }}
+        run: git push --force-with-lease="refs/heads/$BRANCH:$OLD" origin "HEAD:refs/heads/$BRANCH"
